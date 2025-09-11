@@ -1,6 +1,7 @@
 import enum
 import copy
 from tqdm import tqdm
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -66,9 +67,9 @@ class DiffusionModule(BaseModule):
         self,
         x_start: CrystalBatch,
         t: Tensor,
-        noise_atom_types: Tensor | None = None,
-        noise_lattices: Tensor | None = None,
-        noise_frac_coords: Tensor | None = None,
+        noise_atom_types: Optional[Tensor] = None,
+        noise_lattices: Optional[Tensor] = None,
+        noise_frac_coords: Optional[Tensor] = None,
     ) -> CrystalBatch:
         """
         Sample from the forward process q(x_t | x_0).
@@ -102,8 +103,8 @@ class DiffusionModule(BaseModule):
     def calculate_loss(
         self,
         x_start: CrystalBatch,
-        t: Tensor | None = None,
-        cond_embeds: Tensor | None = None,
+        t: Optional[Tensor] = None,
+        cond_embeds: Optional[Tensor] = None,
     ):
         if t is None:
             t = uniform_sample_t(
@@ -172,8 +173,9 @@ class DiffusionModule(BaseModule):
         t: Tensor,
         step_lr: float = 1e-5,
         cond_scale: float = 2.0,
-        cond_embeds: Tensor | None = None,
-        null_cond_embeds: Tensor | None = None,
+        cond_embeds: Optional[Tensor] = None,
+        null_cond_embeds: Optional[Tensor] = None,
+        freeze_atom_types: bool = False,
     ) -> CrystalBatch:
         """
         Sample from the reverse process p(x_{t-1} | x_t).
@@ -189,14 +191,14 @@ class DiffusionModule(BaseModule):
         )
         predictor_output = CrystalBatch(
             atom_types=(
-                self.diffusion_atom_type.p_sample(
+                x_t.atom_types
+                if (freeze_atom_types or self.diffusion_atom_type is None)
+                else self.diffusion_atom_type.p_sample(
                     pred_x_start_logits=model_predictor_output.atom_types,
                     x_t=x_t.atom_types,
                     t=t,
                     batch_idx=x_t.batch,
                 )
-                if self.diffusion_atom_type is not None
-                else x_t.atom_types
             ),
             lattices=self.diffusion_lattice.p_sample(
                 model_output=model_predictor_output.lattices,
@@ -244,7 +246,7 @@ class DiffusionModule(BaseModule):
         self,
         task: str,
         num_atoms: list[int] | Tensor,
-        atom_types: list[int] | Tensor | None = None,
+        atom_types: Optional[list[int] | Tensor] = None,
         return_trajectory: bool = False,
         step_lr: float = 1e-5,
         verbose: bool = True,
@@ -316,13 +318,104 @@ class DiffusionModule(BaseModule):
             return trajectory
         return trajectory.get_atoms(t=0)
 
+    def sdedit(
+        self,
+        *,
+        x0: CrystalBatch,
+        t_start: int | float,
+        return_trajectory: bool = False,
+        step_lr: float = 1e-5,
+        cond_scale: float = 2.0,
+        cond_embeds: Optional[Tensor] = None,
+        null_cond_embeds: Optional[Tensor] = None,
+        verbose: bool = True,
+        freeze_atom_types: bool = True,
+    ):
+        """
+        SDEdit-style sampling: start from an existing crystal x0, add noise to a
+        mid/high timestep t* to obtain x_{t*}, then run the reverse process to t=0.
+
+        - If ``t_start`` is a float in (0, 1], it is treated as a fraction of the
+          total diffusion steps and converted to an integer timestep.
+        - If ``freeze_atom_types`` is True, atom types are kept fixed during
+          both noising and denoising (preserves composition/identity).
+        """
+        assert x0.atom_types.device == self.device, "x0 must be on the same device"
+
+        if isinstance(t_start, float):
+            assert 0.0 < t_start <= 1.0, "t_start as ratio must be in (0, 1]"
+            t_idx = int(torch.ceil(torch.tensor(t_start * self.num_timesteps)).item())
+        else:
+            t_idx = int(t_start)
+        t_idx = max(1, min(self.num_timesteps, t_idx))
+
+        # Prepare noise per component
+        noise_atom_types = None
+        if (self.diffusion_atom_type is not None) and (not freeze_atom_types):
+            noise_atom_types = torch.rand(
+                len(x0.atom_types), self.diffusion_atom_type.max_atoms, device=self.device
+            )
+        noise_lattices = torch.randn_like(x0.lattices)
+        noise_frac_coords = torch.randn_like(x0.frac_coords)
+
+        # Build x_{t*}
+        t = torch.ones((x0.num_graphs,), dtype=torch.long, device=self.device) * t_idx
+        if freeze_atom_types or (self.diffusion_atom_type is None):
+            x_t = CrystalBatch(
+                atom_types=x0.atom_types,
+                lattices=self.diffusion_lattice.q_sample(
+                    x_start=x0.lattices, t=t, noise=noise_lattices
+                ),
+                frac_coords=self.diffusion_frac_coord.q_sample(
+                    x_start=x0.frac_coords, t=t, batch_idx=x0.batch, noise=noise_frac_coords
+                ),
+                num_atoms=x0.num_atoms,
+                batch=x0.batch,
+                num_graphs=x0.num_graphs,
+                num_nodes=x0.num_nodes,
+            )
+        else:
+            x_t = self.q_sample(
+                x_start=x0,
+                t=t,
+                noise_atom_types=noise_atom_types,
+                noise_lattices=noise_lattices,
+                noise_frac_coords=noise_frac_coords,
+            )
+
+        # Trajectory
+        trajectory = Trajectory(total_steps=t_idx)
+        trajectory.container[t_idx] = x_t
+
+        # Reverse process from t_idx -> 0
+        timesteps = range(t_idx, 0, -1)
+        if verbose:
+            timesteps = tqdm(timesteps, desc="SDEdit Sampling")
+        for timestep in timesteps:
+            t_curr = torch.ones((x0.num_graphs,), dtype=torch.long, device=self.device) * timestep
+            with torch.no_grad():
+                x_t = self.p_sample(
+                    x_t=x_t,
+                    t=t_curr,
+                    step_lr=step_lr,
+                    cond_scale=cond_scale,
+                    cond_embeds=cond_embeds,
+                    null_cond_embeds=null_cond_embeds,
+                    freeze_atom_types=freeze_atom_types,
+                )
+            trajectory.container[timestep - 1] = x_t
+
+        if return_trajectory:
+            return trajectory
+        return trajectory.get_atoms(t=0)
+
 
 def _model_prediction(
     model: CSPNet,
     x_t: CrystalBatch,
     t: Tensor,
-    cond_embeds: Tensor | None = None,
-    null_cond_embeds: Tensor | None = None,
+    cond_embeds: Optional[Tensor] = None,
+    null_cond_embeds: Optional[Tensor] = None,
     cond_scale: float = 1.0,
 ) -> CrystalBatch:
     if cond_embeds is not None:

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from chemeleon_dng.diffusion.models.base import DiffusionModelBase
+from typing import Optional
 
 
 class DSM(DiffusionModelBase):
@@ -53,7 +54,7 @@ class DSM(DiffusionModelBase):
         x_t: Tensor,
         t: Tensor,
         batch_idx: Tensor,
-        noise: Tensor | None = None,
+        noise: Optional[Tensor] = None,
         mode: str = "predictor",
         step_lr: float = 1e-5,
     ):

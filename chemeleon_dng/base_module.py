@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -66,7 +67,7 @@ class BaseModule(LightningModule):
         self,
         res: dict,
         split: str,
-        batch_size: int | None = None,
+        batch_size: Optional[int] = None,
     ):
         for k, v in res.items():
             self.log(

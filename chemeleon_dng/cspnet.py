@@ -1,5 +1,6 @@
 # https://github.com/jiaor17/DiffCSP
 import enum
+from typing import Optional
 import math
 from collections import namedtuple
 
@@ -207,7 +208,7 @@ class CSPNet(nn.Module):
         smooth=False,
         cond_dim=0,
         pred_atom_types=True,
-        task: CSPNetTask | None = None,
+        task: Optional[CSPNetTask] = None,
     ):
         super().__init__()
         self.task = task

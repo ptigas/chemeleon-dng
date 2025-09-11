@@ -15,8 +15,10 @@ from monty.serialization import dumpfn
 
 import torch
 from chemeleon_dng.diffusion.diffusion_module import DiffusionModule
+from chemeleon_dng.schema import crystalbatch_from_atoms
 from chemeleon_dng.dataset.num_atom_distributions import NUM_ATOM_DISTRIBUTIONS
 from chemeleon_dng.download_util import get_checkpoint_path
+from ase import Atoms
 
 DEFAULT_MODEL_PATH = {
     "csp": "ckpts/chemeleon_csp_alex_mp_20_v0.0.2.ckpt",
@@ -68,7 +70,7 @@ def sample_csp(
 
 def sample_dng(
     dm: DiffusionModule,
-    num_atom_distribution: str | list[int],
+    num_atom_distribution: str | list,
     num_samples: int,
     batch_size: int,
     output_path: Path,
@@ -109,7 +111,7 @@ def sample(
     num_samples: int = 100,
     batch_size: int | None = None,
     formulas: str | tuple | list | None = None,  # Only for CSP task
-    num_atom_distribution: str | list[int] | None = "mp-20",  # Only for DNG task
+    num_atom_distribution: str | list | None = "mp-20",  # Only for DNG task
     model_path: str | None = None,
     output_dir: str = "./results",
     device: str | None = None,
@@ -239,5 +241,118 @@ def sample(
         )
 
 
-if __name__ == "__main__":
+def sdedit(
+    input_path: str | Path | Atoms | list,
+    t_start: int | float = 0.6,
+    num_variations: int = 4,
+    model_path: str | None = None,
+    output_dir: str = "./results_sdedit",
+    device: str | None = None,
+    freeze_atom_types: bool = True,
+    save_json: bool = True,
+    batch_size: int | None = None,
+):
+    """SDEdit-style variations starting from an existing structure.
+
+    - ``input_path``: CIF file, directory of CIFs, an ASE ``Atoms`` or list of ``Atoms``.
+    - ``t_start``: integer timestep in [1, T] or ratio (0, 1].
+    - ``num_variations``: number of variations per input structure.
+    - ``freeze_atom_types``: keep atom types fixed to preserve composition.
+    - ``batch_size``: maximum number of structures to process in a single batch. If None, processes all structures together.
+    """
+    # Device
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Model
+    if model_path is None:
+        # Default to CSP checkpoint to preserve atom types by design
+        model_path = get_checkpoint_path("csp", DEFAULT_MODEL_PATH)
+    print(f"Using checkpoint path: {model_path}")
+    dm = DiffusionModule.load_from_checkpoint(model_path, map_location=device)
+
+    # Resolve inputs: files or ASE Atoms
+    inputs_atoms: list[Atoms] = []
+    input_names: list[str] = []
+
+    if isinstance(input_path, Atoms):
+        inputs_atoms = [input_path]
+        input_names = [input_path.get_chemical_formula()]  # type: ignore
+    elif isinstance(input_path, list) and input_path and isinstance(input_path[0], Atoms):
+        inputs_atoms = input_path  # type: ignore
+        input_names = [at.get_chemical_formula() for at in inputs_atoms]  # type: ignore
+    else:
+        p = Path(input_path)  # type: ignore[arg-type]
+        if p.is_dir():
+            files = sorted(list(p.glob("*.cif")))
+            assert files, f"No CIF files found in directory: {p}"
+        else:
+            files = [p]
+        for fi in files:
+            s = Structure.from_file(str(fi))
+            at = s.to_ase_atoms()
+            inputs_atoms.append(at)
+            input_names.append(fi.stem)
+    print(f"Found {len(inputs_atoms)} input structure(s)")
+
+    # Output directory
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set default batch size if not provided
+    if batch_size is None:
+        batch_size = len(inputs_atoms) * num_variations
+    
+    # Create all structure variations for batch processing
+    all_atoms_list = []
+    structure_indices = []  # Track which input structure each variation belongs to
+    
+    for i, at in enumerate(inputs_atoms):
+        for _ in range(num_variations):
+            all_atoms_list.append(at.copy())
+            structure_indices.append(i)
+    
+    print(f"Processing {len(all_atoms_list)} total variations ({len(inputs_atoms)} structures × {num_variations} variations each) in batches of {batch_size}")
+    
+    # Process in batches
+    all_gen_atoms = []
+    for batch_start in range(0, len(all_atoms_list), batch_size):
+        batch_end = min(batch_start + batch_size, len(all_atoms_list))
+        print(f"Processing batch {batch_start//batch_size + 1}: structures {batch_start} to {batch_end-1}")
+        
+        batch_atoms = all_atoms_list[batch_start:batch_end]
+        x0 = crystalbatch_from_atoms(batch_atoms, device=device)
+
+        gen_atoms_list = dm.sdedit(
+            x0=x0,
+            t_start=t_start,
+            freeze_atom_types=freeze_atom_types,
+            verbose=False,
+        )
+        
+        all_gen_atoms.extend(gen_atoms_list)
+    
+    # Save results grouped by input structure
+    for i, (gen_atoms, struct_idx) in enumerate(zip(all_gen_atoms, structure_indices)):
+        input_name = input_names[struct_idx]
+        variation_idx = i - struct_idx * num_variations  # Calculate variation index for this structure
+        gen_atoms.write(out_dir / f"{input_name}_sdedit_{variation_idx}.cif")  # type: ignore
+
+    # Save JSON bundle
+    if save_json:
+        gen_atoms_files = list(out_dir.glob("*_sdedit_*.cif"))
+        all_gen_atoms_list = [Structure.from_file(file) for file in gen_atoms_files]
+        dumpfn(all_gen_atoms_list, out_dir / "sdedit_structures.json.gz")
+        print(
+            f"Saved {len(all_gen_atoms_list)} SDEdit structures to: {out_dir / 'sdedit_structures.json.gz'}"
+        )
+
+
+def main():
+    """Main CLI entry point for chemeleon-sample command."""
     fire.Fire(sample)
+
+
+if __name__ == "__main__":
+    main()

@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from chemeleon_dng.diffusion.models.base import DiffusionModelBase
+from typing import Optional
 
 
 class D3PM(DiffusionModelBase):
@@ -101,7 +102,7 @@ class D3PM(DiffusionModelBase):
         x_start: Tensor,
         t: Tensor,
         batch_idx: Tensor,
-        noise: Tensor | None = None,
+        noise: Optional[Tensor] = None,
     ):
         """Sample from q(x_t | x_start) (i.e. add noise to the data).
         q(x_t | x_start) = Categorical(x_t ; p = x_start Q_{1...t})
