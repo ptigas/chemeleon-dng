@@ -7,7 +7,7 @@ name = "chemeleon-dng"
 version = "0.1.0"
 description = "Chemeleon for De Novo Generation - A framework for crystal structure generation and prediction"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = {text = "MIT"}
 authors = [
     {name = "Chemeleon-DNG Contributors"}
@@ -31,14 +31,18 @@ dependencies = [
     "torch>=2.1.0",
     "pytorch-lightning>=2.1.0",
     "sacred",
-    "ase",
+    "ase>=3.20.0",
     "torch-geometric",
     "torchmetrics",
     "tqdm",
     "wandb",
-    "pydantic",
-    "pymatgen",
+    "pydantic>=2.0.0",
+    "pymatgen>=2023.1.1",
     "fire",
+    # Ensure compatible versions for scientific computing stack
+    "numpy>=1.21.0,<2.0",
+    "scipy>=1.7.0",
+    "numba>=0.57.0",
 ]
 
 [project.optional-dependencies]
@@ -69,6 +73,17 @@ docs = [
     "sphinx",
     "sphinx-rtd-theme",
     "myst-parser",
+]
+
+# For users who want minimal dependencies (avoiding pymatgen)
+minimal = [
+    "torch>=2.1.0",
+    "pytorch-lightning>=2.1.0",
+    "ase>=3.20.0",
+    "torch-geometric",
+    "pydantic>=2.0.0",
+    "fire",
+    "tqdm",
 ]
 
 [project.urls]
